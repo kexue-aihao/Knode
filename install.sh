@@ -4,10 +4,12 @@ set -euo pipefail
 REPO="${KNODE_REPO:-kexue-aihao/Knode}"
 GITHUB_API="${KNODE_GITHUB_API:-https://api.github.com}"
 GITHUB_BASE="${KNODE_GITHUB_BASE:-https://github.com}"
+GITHUB_RAW="${KNODE_GITHUB_RAW:-https://raw.githubusercontent.com}"
 
 INSTALL_DIR="${KNODE_INSTALL_DIR:-/usr/local/bin}"
 BIN_NAME="${KNODE_BIN_NAME:-knode}"
 BIN_PATH="${INSTALL_DIR}/${BIN_NAME}"
+MANAGER_PATH="${KNODE_MANAGER_PATH:-/usr/local/bin/knode-manager}"
 CONFIG_PATH="${KNODE_CONFIG:-/etc/knode/knode.json}"
 SERVICE_NAME="${KNODE_SERVICE_NAME:-knode}"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -49,6 +51,11 @@ Knode installer
 Usage:
   bash install.sh install     Install latest Knode release
   bash install.sh upgrade     Upgrade to latest Knode release and restart service
+  bash install.sh menu        Open interactive management menu
+  bash install.sh start       Start systemd service
+  bash install.sh stop        Stop systemd service
+  bash install.sh restart     Restart systemd service
+  bash install.sh logs        Show systemd logs
   bash install.sh status      Show installed and latest versions
   bash install.sh uninstall   Remove systemd service and binary
   bash install.sh help        Show this help
@@ -65,10 +72,12 @@ Kboard/env integration:
   KNODE_ADMIN_ADDR           admin listen address, default: 127.0.0.1:8080
   KNODE_CONFIG               config path, default: /etc/knode/knode.json
   KNODE_SYSTEMD=0            install binary and config only, skip systemd
+  KNODE_MANAGER_PATH         manager shortcut path, default: /usr/local/bin/knode-manager
 
 Examples:
   bash install.sh install
   bash install.sh upgrade
+  bash install.sh menu
   KNODE_CLIENT_SECRET=... KNODE_SERVER_SIGNING_KEY=... bash install.sh install
 EOF
 }
@@ -110,6 +119,10 @@ latest_tag() {
   http_get "${GITHUB_API}/repos/${REPO}/releases/latest" |
     grep -m1 '"tag_name"' |
     sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+}
+
+install_script_url() {
+  printf '%s/%s/master/install.sh' "$GITHUB_RAW" "$REPO"
 }
 
 detect_asset_suffix() {
@@ -224,6 +237,20 @@ install_binary() {
   trap - EXIT
   log "installed ${BIN_PATH}"
   "$BIN_PATH" version || true
+}
+
+install_manager_script() {
+  local tmp url
+  tmp="$(mktemp)"
+  url="$(install_script_url)"
+  if http_download "$url" "$tmp"; then
+    install -d -m 0755 "$(dirname "$MANAGER_PATH")"
+    install -m 0755 "$tmp" "$MANAGER_PATH"
+    log "installed manager shortcut ${MANAGER_PATH}"
+  else
+    log "manager script update skipped"
+  fi
+  rm -f "$tmp"
 }
 
 json_escape() {
@@ -440,11 +467,237 @@ EOF
   fi
 }
 
+require_systemctl() {
+  command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
+}
+
+service_exists() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl list-unit-files "${SERVICE_NAME}.service" 2>/dev/null | grep -q "^${SERVICE_NAME}.service"
+}
+
+service_state() {
+  if ! service_exists; then
+    printf '未安装'
+    return
+  fi
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    printf '已运行'
+  else
+    printf '未运行'
+  fi
+}
+
+autostart_state() {
+  if service_exists && systemctl is-enabled --quiet "$SERVICE_NAME"; then
+    printf '是'
+  else
+    printf '否'
+  fi
+}
+
+choose_editor() {
+  if [ -n "${EDITOR:-}" ] && command -v "$EDITOR" >/dev/null 2>&1; then
+    printf '%s' "$EDITOR"
+    return
+  fi
+  for editor in nano vim vi; do
+    if command -v "$editor" >/dev/null 2>&1; then
+      printf '%s' "$editor"
+      return
+    fi
+  done
+  return 1
+}
+
+read_tty() {
+  local prompt="$1"
+  local answer=""
+  if [ "${KNODE_MENU_TTY:-1}" != "0" ] && [ -e /dev/tty ] && { : </dev/tty; } 2>/dev/null; then
+    printf '%s' "$prompt" >/dev/tty
+    IFS= read -r answer </dev/tty || true
+  else
+    printf '%s' "$prompt" >&2
+    IFS= read -r answer || true
+  fi
+  answer="${answer%$'\r'}"
+  printf '%s' "$answer"
+}
+
+pause_menu() {
+  read_tty "按回车键继续..." >/dev/null
+}
+
+confirm() {
+  local prompt answer
+  prompt="$1"
+  answer="$(read_tty "${prompt} [y/N]: ")"
+  case "$answer" in
+    y|Y|yes|YES)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+do_edit_config() {
+  need_root
+  local editor
+  if [ ! -f "$CONFIG_PATH" ]; then
+    install -d -m 0755 "$(dirname "$CONFIG_PATH")"
+    if [ -x "$BIN_PATH" ]; then
+      "$BIN_PATH" init -config "$CONFIG_PATH" >/dev/null || true
+    else
+      : > "$CONFIG_PATH"
+    fi
+    chmod 0600 "$CONFIG_PATH" 2>/dev/null || true
+  fi
+  editor="$(choose_editor)" || die "no editor found; install nano/vim/vi or set EDITOR"
+  "$editor" "$CONFIG_PATH"
+  if config_ready; then
+    log "config check passed"
+    if service_exists && confirm "是否重启 ${SERVICE_NAME} 使配置生效"; then
+      systemctl restart "$SERVICE_NAME"
+      log "service ${SERVICE_NAME} restarted"
+    fi
+  else
+    log "config check failed; run: ${BIN_PATH} check -config ${CONFIG_PATH}"
+  fi
+}
+
+do_generate_config() {
+  need_root
+  if [ -f "$CONFIG_PATH" ]; then
+    if confirm "配置文件已存在，是否备份并覆盖 ${CONFIG_PATH}"; then
+      backup_config
+    else
+      log "cancelled"
+      return
+    fi
+  fi
+  if write_env_config; then
+    log "created config from environment: ${CONFIG_PATH}"
+  elif [ -x "$BIN_PATH" ]; then
+    install -d -m 0755 "$(dirname "$CONFIG_PATH")"
+    "$BIN_PATH" init -config "$CONFIG_PATH" >/dev/null || true
+    chmod 0600 "$CONFIG_PATH" 2>/dev/null || true
+    log "created sample config ${CONFIG_PATH}"
+  else
+    die "Knode binary is not installed; install first"
+  fi
+  if config_ready; then
+    log "config check passed"
+  else
+    log "config needs editing before service start"
+  fi
+}
+
+do_start() {
+  need_root
+  require_systemctl
+  service_exists || install_service
+  config_ready || die "config is not ready: ${CONFIG_PATH}"
+  systemctl start "$SERVICE_NAME"
+  log "service ${SERVICE_NAME} started"
+}
+
+do_stop() {
+  need_root
+  require_systemctl
+  service_exists || die "service ${SERVICE_NAME} is not installed"
+  systemctl stop "$SERVICE_NAME"
+  log "service ${SERVICE_NAME} stopped"
+}
+
+do_restart() {
+  need_root
+  require_systemctl
+  service_exists || install_service
+  config_ready || die "config is not ready: ${CONFIG_PATH}"
+  systemctl restart "$SERVICE_NAME"
+  log "service ${SERVICE_NAME} restarted"
+}
+
+do_enable() {
+  need_root
+  require_systemctl
+  service_exists || install_service
+  systemctl enable "$SERVICE_NAME" >/dev/null
+  log "service ${SERVICE_NAME} enabled"
+}
+
+do_disable() {
+  need_root
+  require_systemctl
+  service_exists || die "service ${SERVICE_NAME} is not installed"
+  systemctl disable "$SERVICE_NAME" >/dev/null
+  log "service ${SERVICE_NAME} disabled"
+}
+
+do_logs() {
+  require_systemctl
+  service_exists || die "service ${SERVICE_NAME} is not installed"
+  journalctl -u "$SERVICE_NAME" -e --no-pager -n "${KNODE_LOG_LINES:-200}"
+}
+
+do_version() {
+  local latest current
+  latest="$(latest_tag 2>/dev/null || true)"
+  current="$(installed_version || true)"
+  printf '当前版本: %s\n' "${current:-未安装}"
+  printf '最新版本: %s\n' "${latest:-unknown}"
+  if [ -x "$BIN_PATH" ]; then
+    "$BIN_PATH" version || true
+  fi
+}
+
+config_ports() {
+  [ -f "$CONFIG_PATH" ] || return 0
+  grep -E '"(listen|address)"[[:space:]]*:' "$CONFIG_PATH" |
+    sed -nE 's/.*"[^"]*:([0-9]+)".*/\1/p' |
+    sort -n -u
+}
+
+open_port() {
+  local port="$1"
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${port}/tcp"
+    return
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${port}/tcp"
+    firewall-cmd --reload
+    return
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null ||
+      iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+    return
+  fi
+  die "no supported firewall tool found: ufw/firewall-cmd/iptables"
+}
+
+do_open_ports() {
+  need_root
+  local ports port
+  ports="$(config_ports)"
+  [ -n "$ports" ] || die "no ports found in ${CONFIG_PATH}"
+  printf '%s\n' "$ports" | while IFS= read -r port; do
+    [ -n "$port" ] || continue
+    log "allow tcp/${port}"
+    open_port "$port"
+  done
+  log "firewall rules updated"
+}
+
 do_install() {
   need_root
   install_binary "${KNODE_VERSION:-}"
   ensure_config
   install_service
+  install_manager_script
 }
 
 do_upgrade() {
@@ -465,6 +718,7 @@ do_upgrade() {
     log "upgrading ${current:-not-installed} -> ${tag:-GitHub latest}"
     install_binary "$tag"
   fi
+  install_manager_script
 
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1; then
     if config_ready; then
@@ -502,6 +756,124 @@ do_uninstall() {
   log "kept config ${CONFIG_PATH}"
 }
 
+show_menu() {
+  local current latest state autostart
+  current="$(installed_version || true)"
+  latest="$(latest_tag 2>/dev/null || true)"
+  state="$(service_state)"
+  autostart="$(autostart_state)"
+
+  if [ -t 1 ]; then
+    clear || true
+  fi
+  cat <<EOF
+Knode 节点后端管理脚本
+------ github.com/kexue-aihao/Knode ------
+0. 修改配置
+-------------------------------------------
+1. 安装 Knode
+2. 更新 Knode
+3. 卸载 Knode
+-------------------------------------------
+4. 启动 Knode
+5. 停止 Knode
+6. 重启 Knode
+7. 查看 Knode 状态
+8. 查看 Knode 日志
+-------------------------------------------
+9. 设置 Knode 开机自启
+10. 取消 Knode 开机自启
+-------------------------------------------
+11. 查看 Knode 版本
+12. 升级 Knode 维护脚本
+13. 生成 Knode 配置文件
+14. 放行 Knode 配置中的网络端口
+15. 退出脚本
+
+Knode状态: ${state}
+是否开机自启: ${autostart}
+当前版本: ${current:-未安装}
+最新版本: ${latest:-unknown}
+配置文件: ${CONFIG_PATH}
+EOF
+}
+
+run_menu_action() {
+  local choice="$1"
+  case "$choice" in
+    0)
+      do_edit_config
+      ;;
+    1)
+      do_install
+      ;;
+    2)
+      do_upgrade
+      ;;
+    3)
+      if confirm "确认卸载 Knode"; then
+        do_uninstall
+      else
+        log "cancelled"
+      fi
+      ;;
+    4)
+      do_start
+      ;;
+    5)
+      do_stop
+      ;;
+    6)
+      do_restart
+      ;;
+    7)
+      do_status
+      ;;
+    8)
+      do_logs
+      ;;
+    9)
+      do_enable
+      ;;
+    10)
+      do_disable
+      ;;
+    11)
+      do_version
+      ;;
+    12)
+      need_root
+      install_manager_script
+      ;;
+    13)
+      do_generate_config
+      ;;
+    14)
+      do_open_ports
+      ;;
+    15|q|Q|exit)
+      exit 0
+      ;;
+    *)
+      log "unknown option: ${choice}"
+      ;;
+  esac
+}
+
+do_menu() {
+  local choice
+  while true; do
+    show_menu
+    choice="$(read_tty "请输入选项 [0-15]: ")"
+    printf '\n'
+    if ! run_menu_action "$choice"; then
+      log "operation failed"
+    fi
+    printf '\n'
+    pause_menu
+  done
+}
+
 main() {
   local action="${1:-install}"
   case "$action" in
@@ -510,6 +882,43 @@ main() {
       ;;
     upgrade|update)
       do_upgrade
+      ;;
+    menu|manage)
+      do_menu
+      ;;
+    edit-config|config)
+      do_edit_config
+      ;;
+    start)
+      do_start
+      ;;
+    stop)
+      do_stop
+      ;;
+    restart)
+      do_restart
+      ;;
+    logs|log)
+      do_logs
+      ;;
+    enable)
+      do_enable
+      ;;
+    disable)
+      do_disable
+      ;;
+    version)
+      do_version
+      ;;
+    update-script)
+      need_root
+      install_manager_script
+      ;;
+    gen-config)
+      do_generate_config
+      ;;
+    open-ports)
+      do_open_ports
       ;;
     status)
       do_status

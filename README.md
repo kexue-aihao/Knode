@@ -37,6 +37,18 @@ curl -fsSL https://raw.githubusercontent.com/kexue-aihao/Knode/master/install.sh
 curl -fsSL https://raw.githubusercontent.com/kexue-aihao/Knode/master/install.sh | sudo bash -s -- upgrade
 ```
 
+打开快捷管理菜单：
+
+```bash
+sudo knode-manager
+```
+
+或直接从 GitHub 进入菜单：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kexue-aihao/Knode/master/install.sh | sudo bash -s -- menu
+```
+
 对接 Kboard 时可以通过环境变量下发 KLESS 配置：
 
 ```bash
