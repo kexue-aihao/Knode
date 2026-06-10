@@ -31,6 +31,8 @@ func main() {
 }
 
 func run(args []string, logger *log.Logger) error {
+	node.SetBuildInfo(version, commit, date)
+
 	if len(args) == 0 {
 		return openManagerMenu()
 	}
