@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -258,11 +259,32 @@ func (k KLESSConfig) ClientConfig(transport string) (kless.ClientConfig, error) 
 }
 
 func (k KLESSConfig) ClientSecretBytes() ([]byte, error) {
-	return kless.DecodeKey(strings.TrimSpace(k.ClientSecret))
+	return decodeKey(k.ClientSecret)
 }
 
 func (k KLESSConfig) ServerSigningKeyBytes() ([]byte, error) {
-	return kless.DecodeKey(strings.TrimSpace(k.ServerSigningKey))
+	return decodeKey(k.ServerSigningKey)
+}
+
+func decodeKey(text string) ([]byte, error) {
+	text = strings.TrimSpace(text)
+	encodings := []*base64.Encoding{
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+	}
+	var firstErr error
+	for _, encoding := range encodings {
+		out, err := encoding.DecodeString(text)
+		if err == nil {
+			return out, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return nil, firstErr
 }
 
 func (i *InboundConfig) Validate(upstreams map[string]struct{}) error {

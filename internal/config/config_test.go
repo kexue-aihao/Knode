@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/kexue-aihao/Knode/internal/config"
@@ -41,6 +42,40 @@ func TestConfigValidateAcceptsKLESSMaterial(t *testing.T) {
 	}
 	if cfg.Admin.Address != config.DefaultAdminAddress {
 		t.Fatalf("Admin.Address = %q, want %q", cfg.Admin.Address, config.DefaultAdminAddress)
+	}
+}
+
+func TestConfigValidateAcceptsBase64URLKLESSMaterial(t *testing.T) {
+	serverPublic, _, err := kless.GenerateServerIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSecret, err := kless.GenerateClientSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		NodeID: "kboard-node-2",
+		Upstreams: []config.UpstreamConfig{
+			{
+				Name:      "primary",
+				Transport: config.TransportTCP,
+				Address:   "127.0.0.1:9000",
+				KLESS: config.KLESSConfig{
+					ClientID:         "kboard-node-2",
+					ClientSecret:     base64.RawURLEncoding.EncodeToString(clientSecret),
+					ServerSigningKey: base64.RawURLEncoding.EncodeToString(serverPublic),
+				},
+			},
+		},
+		Inbounds: []config.InboundConfig{
+			{Name: "local", Listen: "0.0.0.0:36514", Upstream: "primary"},
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }
 
