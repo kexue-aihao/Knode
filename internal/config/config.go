@@ -37,12 +37,25 @@ type Config struct {
 	NodeID        string           `json:"node_id"`
 	Admin         AdminConfig      `json:"admin"`
 	ShutdownGrace string           `json:"shutdown_grace,omitempty"`
+	Kboard        *KboardConfig    `json:"kboard,omitempty"`
 	Upstreams     []UpstreamConfig `json:"upstreams"`
 	Inbounds      []InboundConfig  `json:"inbounds"`
 }
 
 type AdminConfig struct {
 	Address string `json:"address"`
+}
+
+type KboardConfig struct {
+	PublicURL          string `json:"public_url"`
+	NodeID             string `json:"node_id"`
+	NodeSharedSecret   string `json:"node_shared_secret"`
+	ConfigEndpoint     string `json:"config_endpoint,omitempty"`
+	UsersEndpoint      string `json:"users_endpoint,omitempty"`
+	TrafficEndpoint    string `json:"traffic_endpoint,omitempty"`
+	AliveEndpoint      string `json:"alive_endpoint,omitempty"`
+	AccessLogsEndpoint string `json:"access_logs_endpoint,omitempty"`
+	ReportInterval     string `json:"report_interval,omitempty"`
 }
 
 type UpstreamConfig struct {
@@ -116,6 +129,11 @@ func (c *Config) Validate() error {
 	if _, err := parseDuration(c.ShutdownGrace, DefaultShutdownGrace); err != nil {
 		return fmt.Errorf("shutdown_grace: %w", err)
 	}
+	if c.Kboard != nil {
+		if err := c.Kboard.Validate(); err != nil {
+			return fmt.Errorf("kboard: %w", err)
+		}
+	}
 
 	upstreams := make(map[string]struct{}, len(c.Upstreams))
 	for i := range c.Upstreams {
@@ -141,6 +159,34 @@ func (c *Config) Validate() error {
 		inbounds[name] = struct{}{}
 	}
 	return nil
+}
+
+func (k *KboardConfig) Validate() error {
+	k.applyDefaults()
+	if k.PublicURL == "" {
+		return errors.New("public_url is required")
+	}
+	if k.NodeID == "" {
+		return errors.New("node_id is required")
+	}
+	if k.NodeSharedSecret == "" {
+		return errors.New("node_shared_secret is required")
+	}
+	if k.AliveEndpoint == "" {
+		return errors.New("alive_endpoint is required")
+	}
+	if _, err := url.ParseRequestURI(k.PublicURL); err != nil {
+		return fmt.Errorf("public_url: %w", err)
+	}
+	if _, err := parseDuration(k.ReportInterval, 30*time.Second); err != nil {
+		return fmt.Errorf("report_interval: %w", err)
+	}
+	return nil
+}
+
+func (k KboardConfig) ReportIntervalDuration() time.Duration {
+	d, _ := parseDuration(k.ReportInterval, 30*time.Second)
+	return d
 }
 
 func (c *Config) ShutdownGraceDuration() time.Duration {
@@ -320,6 +366,37 @@ func (c *Config) applyDefaults() {
 	for i := range c.Upstreams {
 		c.Upstreams[i].applyDefaults()
 	}
+	if c.Kboard != nil {
+		c.Kboard.applyDefaults()
+	}
+}
+
+func (k *KboardConfig) applyDefaults() {
+	k.PublicURL = strings.TrimRight(strings.TrimSpace(k.PublicURL), "/")
+	k.NodeID = strings.TrimSpace(k.NodeID)
+	k.NodeSharedSecret = strings.TrimSpace(k.NodeSharedSecret)
+	k.ConfigEndpoint = normalizeEndpoint(k.ConfigEndpoint)
+	k.UsersEndpoint = normalizeEndpoint(k.UsersEndpoint)
+	k.TrafficEndpoint = normalizeEndpoint(k.TrafficEndpoint)
+	k.AliveEndpoint = normalizeEndpoint(k.AliveEndpoint)
+	k.AccessLogsEndpoint = normalizeEndpoint(k.AccessLogsEndpoint)
+	if k.ReportInterval == "" {
+		k.ReportInterval = "30s"
+	}
+}
+
+func normalizeEndpoint(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		return endpoint
+	}
+	if !strings.HasPrefix(endpoint, "/") {
+		return "/" + endpoint
+	}
+	return endpoint
 }
 
 func (u *UpstreamConfig) applyDefaults() {

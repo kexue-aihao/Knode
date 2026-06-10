@@ -79,6 +79,51 @@ func TestConfigValidateAcceptsBase64URLKLESSMaterial(t *testing.T) {
 	}
 }
 
+func TestConfigValidateAcceptsKboardControlConfig(t *testing.T) {
+	serverPublic, _, err := kless.GenerateServerIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSecret, err := kless.GenerateClientSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		NodeID: "kboard-node-2",
+		Kboard: &config.KboardConfig{
+			PublicURL:          "https://kboard.example.com",
+			NodeID:             "2",
+			NodeSharedSecret:   "secret",
+			AliveEndpoint:      "/kb-prefix/knode/control/alive",
+			TrafficEndpoint:    "/kb-prefix/knode/control/traffic",
+			AccessLogsEndpoint: "/kb-prefix/knode/control/access-logs",
+		},
+		Upstreams: []config.UpstreamConfig{
+			{
+				Name:      "primary",
+				Transport: config.TransportTCP,
+				Address:   "127.0.0.1:9000",
+				KLESS: config.KLESSConfig{
+					ClientID:         "kboard-node-2",
+					ClientSecret:     kless.EncodeKey(clientSecret),
+					ServerSigningKey: kless.EncodeKey(serverPublic),
+				},
+			},
+		},
+		Inbounds: []config.InboundConfig{
+			{Name: "local", Listen: "0.0.0.0:36514", Upstream: "primary"},
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if cfg.Kboard.ReportInterval != "30s" {
+		t.Fatalf("ReportInterval = %q, want 30s", cfg.Kboard.ReportInterval)
+	}
+}
+
 func TestConfigValidateRejectsUnknownUpstream(t *testing.T) {
 	serverPublic, _, err := kless.GenerateServerIdentity()
 	if err != nil {

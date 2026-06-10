@@ -35,6 +35,17 @@ DEFAULT_PADDING_MIN="${KNODE_PADDING_MIN:-0}"
 DEFAULT_PADDING_MAX="${KNODE_PADDING_MAX:-0}"
 DEFAULT_HANDSHAKE_TIMEOUT="${KNODE_HANDSHAKE_TIMEOUT:-10s}"
 
+KBOARD_PUBLIC_URL="${KBOARD_PUBLIC_URL:-}"
+KBOARD_API_PREFIX="${KBOARD_API_PREFIX:-}"
+KBOARD_NODE_ID="${KBOARD_NODE_ID:-}"
+KBOARD_NODE_SHARED_SECRET="${KBOARD_NODE_SHARED_SECRET:-}"
+KBOARD_KNODE_CONFIG_ENDPOINT="${KBOARD_KNODE_CONFIG_ENDPOINT:-${KBOARD_API_PREFIX:+${KBOARD_API_PREFIX}/knode/control/config}}"
+KBOARD_KNODE_USERS_ENDPOINT="${KBOARD_KNODE_USERS_ENDPOINT:-${KBOARD_API_PREFIX:+${KBOARD_API_PREFIX}/knode/control/users}}"
+KBOARD_KNODE_TRAFFIC_ENDPOINT="${KBOARD_KNODE_TRAFFIC_ENDPOINT:-${KBOARD_API_PREFIX:+${KBOARD_API_PREFIX}/knode/control/traffic}}"
+KBOARD_KNODE_ALIVE_ENDPOINT="${KBOARD_KNODE_ALIVE_ENDPOINT:-${KBOARD_API_PREFIX:+${KBOARD_API_PREFIX}/knode/control/alive}}"
+KBOARD_KNODE_ACCESS_LOGS_ENDPOINT="${KBOARD_KNODE_ACCESS_LOGS_ENDPOINT:-${KBOARD_API_PREFIX:+${KBOARD_API_PREFIX}/knode/control/access-logs}}"
+KBOARD_REPORT_INTERVAL="${KBOARD_REPORT_INTERVAL:-30s}"
+
 log() {
   printf '[knode-install] %s\n' "$*"
 }
@@ -261,6 +272,13 @@ env_config_available() {
   [ -n "${KNODE_CLIENT_SECRET:-}" ] && [ -n "${KNODE_SERVER_SIGNING_KEY:-}" ]
 }
 
+kboard_config_available() {
+  [ -n "$KBOARD_PUBLIC_URL" ] &&
+    [ -n "$KBOARD_NODE_ID" ] &&
+    [ -n "$KBOARD_NODE_SHARED_SECRET" ] &&
+    [ -n "$KBOARD_KNODE_ALIVE_ENDPOINT" ]
+}
+
 ensure_uint() {
   local value="$1"
   local name="$2"
@@ -337,6 +355,23 @@ kless_optional_json() {
   fi
 }
 
+kboard_config_json() {
+  kboard_config_available || return 0
+  cat <<EOF
+  "kboard": {
+    "public_url": "$(json_escape "$KBOARD_PUBLIC_URL")",
+    "node_id": "$(json_escape "$KBOARD_NODE_ID")",
+    "node_shared_secret": "$(json_escape "$KBOARD_NODE_SHARED_SECRET")",
+    "config_endpoint": "$(json_escape "$KBOARD_KNODE_CONFIG_ENDPOINT")",
+    "users_endpoint": "$(json_escape "$KBOARD_KNODE_USERS_ENDPOINT")",
+    "traffic_endpoint": "$(json_escape "$KBOARD_KNODE_TRAFFIC_ENDPOINT")",
+    "alive_endpoint": "$(json_escape "$KBOARD_KNODE_ALIVE_ENDPOINT")",
+    "access_logs_endpoint": "$(json_escape "$KBOARD_KNODE_ACCESS_LOGS_ENDPOINT")",
+    "report_interval": "$(json_escape "$KBOARD_REPORT_INTERVAL")"
+  },
+EOF
+}
+
 backup_config() {
   local backup
   backup="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
@@ -364,7 +399,7 @@ write_env_config() {
     "address": "$(json_escape "$DEFAULT_ADMIN_ADDR")"
   },
   "shutdown_grace": "$(json_escape "$DEFAULT_SHUTDOWN_GRACE")",
-  "upstreams": [
+$(kboard_config_json)  "upstreams": [
     {
       "name": "$(json_escape "$DEFAULT_UPSTREAM_NAME")",
       "transport": "$(json_escape "$DEFAULT_UPSTREAM_TRANSPORT")",
@@ -397,6 +432,12 @@ EOF
 ensure_config() {
   if [ -f "$CONFIG_PATH" ]; then
     if config_ready; then
+      if kboard_config_available && ! grep -q '"kboard"[[:space:]]*:' "$CONFIG_PATH"; then
+        backup_config
+        write_env_config
+        log "recreated config with Kboard integration: ${CONFIG_PATH}"
+        return
+      fi
       log "keeping existing config ${CONFIG_PATH}"
       return
     fi
@@ -478,7 +519,7 @@ service_exists() {
 
 service_state() {
   if ! service_exists; then
-    printf '未安装'
+    printf '服务未安装'
     return
   fi
   if systemctl is-active --quiet "$SERVICE_NAME"; then
@@ -720,7 +761,12 @@ do_upgrade() {
   fi
   install_manager_script
 
-  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1; then
+    if ! service_exists; then
+      ensure_config
+      install_service
+      return
+    fi
     if config_ready; then
       systemctl restart "$SERVICE_NAME"
       log "service ${SERVICE_NAME} restarted"
@@ -739,7 +785,9 @@ do_status() {
   printf 'installed=%s\n' "${current:-not-installed}"
   printf 'binary=%s\n' "$BIN_PATH"
   printf 'config=%s\n' "$CONFIG_PATH"
-  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+  printf 'service=%s\n' "$(service_state)"
+  printf 'autostart=%s\n' "$(autostart_state)"
+  if service_exists; then
     systemctl --no-pager --full status "$SERVICE_NAME" || true
   fi
 }
@@ -790,7 +838,7 @@ Knode 节点后端管理脚本
 14. 放行 Knode 配置中的网络端口
 15. 退出脚本
 
-Knode状态: ${state}
+Knode服务状态: ${state}
 是否开机自启: ${autostart}
 当前版本: ${current:-未安装}
 最新版本: ${latest:-unknown}

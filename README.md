@@ -11,6 +11,7 @@ Knode 负责节点生命周期、配置加载、连接管理、健康检查和�
 - 支持 TCP、TLS、HTTPUpgrade/HTTPUpdate、WebSocket、HTTPStream、gRPC、XHTTP 上游传输配置。
 - 提供 `/healthz`、`/readyz`、`/metrics`、`/status` 管理接口。
 - 提供配置校验、上游连通性检查、样例配置生成和 KLESS 密钥生成命令。
+- 支持安装脚本写入 Kboard 控制面配置，并周期性上报 alive/traffic 状态。
 - GitHub Actions 支持推送 `v*` tag 后自动测试、交叉编译、打包并发布 Release。
 
 ## 快速开始

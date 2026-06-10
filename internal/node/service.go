@@ -112,6 +112,15 @@ func (s *Service) Run(ctx context.Context) error {
 		}()
 	}
 
+	if s.cfg.Kboard != nil {
+		reporter := newKboardReporter(*s.cfg.Kboard, s.cfg.NodeID, s.logger, s.Status)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reporter.run(ctx)
+		}()
+	}
+
 	s.logger.Printf("knode %s started", s.cfg.NodeID)
 	var runErr error
 	select {
