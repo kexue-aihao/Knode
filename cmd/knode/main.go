@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -30,6 +31,10 @@ func main() {
 }
 
 func run(args []string, logger *log.Logger) error {
+	if len(args) == 0 {
+		return openManagerMenu()
+	}
+
 	command := "run"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		command = args[0]
@@ -47,6 +52,8 @@ func run(args []string, logger *log.Logger) error {
 		return initConfig(args)
 	case "gen-keys", "keys":
 		return generateKeys()
+	case "menu", "manage":
+		return openManagerMenu()
 	case "version":
 		fmt.Printf("knode %s commit=%s date=%s\n", version, commit, date)
 		return nil
@@ -56,6 +63,28 @@ func run(args []string, logger *log.Logger) error {
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
+}
+
+func openManagerMenu() error {
+	paths := []string{
+		os.Getenv("KNODE_MANAGER_PATH"),
+		"/usr/local/bin/knode-manager",
+	}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		cmd := exec.Command(path, "menu")
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Env = os.Environ()
+		return cmd.Run()
+	}
+	return fmt.Errorf("knode-manager not found; install or update it with: curl -fsSL https://raw.githubusercontent.com/kexue-aihao/Knode/master/install.sh | sudo bash -s -- update-script")
 }
 
 func runServer(args []string, logger *log.Logger) error {
@@ -145,6 +174,8 @@ func printUsage() {
 	fmt.Print(`Knode node backend
 
 Usage:
+  knode
+  knode menu
   knode run -config knode.json
   knode check -config knode.json
   knode check-upstreams -config knode.json

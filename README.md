@@ -40,6 +40,12 @@ curl -fsSL https://raw.githubusercontent.com/kexue-aihao/Knode/master/install.sh
 打开快捷管理菜单：
 
 ```bash
+sudo knode
+```
+
+安装后也可以使用维护脚本命令：
+
+```bash
 sudo knode-manager
 ```
 
