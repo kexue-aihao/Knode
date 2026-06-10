@@ -14,6 +14,7 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 
 DEFAULT_NODE_ID="${KNODE_NODE_ID:-knode-a}"
 DEFAULT_ADMIN_ADDR="${KNODE_ADMIN_ADDR:-127.0.0.1:8080}"
+DEFAULT_SHUTDOWN_GRACE="${KNODE_SHUTDOWN_GRACE:-10s}"
 DEFAULT_INBOUND_NAME="${KNODE_INBOUND_NAME:-local-tcp}"
 DEFAULT_INBOUND_LISTEN="${KNODE_INBOUND_LISTEN:-127.0.0.1:7000}"
 DEFAULT_MAX_CONNECTIONS="${KNODE_MAX_CONNECTIONS:-1024}"
@@ -21,6 +22,16 @@ DEFAULT_UPSTREAM_NAME="${KNODE_UPSTREAM_NAME:-kray-primary}"
 DEFAULT_UPSTREAM_TRANSPORT="${KNODE_TRANSPORT:-tcp}"
 DEFAULT_UPSTREAM_ADDRESS="${KNODE_UPSTREAM_ADDR:-127.0.0.1:9000}"
 DEFAULT_UPSTREAM_URL="${KNODE_UPSTREAM_URL:-}"
+DEFAULT_SERVER_NAME="${KNODE_SERVER_NAME:-}"
+DEFAULT_CA_FILE="${KNODE_CA_FILE:-}"
+DEFAULT_INSECURE_SKIP_VERIFY="${KNODE_INSECURE_SKIP_VERIFY:-false}"
+DEFAULT_HEADERS_JSON="${KNODE_HEADERS_JSON:-}"
+DEFAULT_DIAL_TIMEOUT="${KNODE_DIAL_TIMEOUT:-10s}"
+DEFAULT_KLESS_CAPABILITIES="${KNODE_KLESS_CAPABILITIES:-}"
+DEFAULT_MAX_FRAME_PAYLOAD="${KNODE_MAX_FRAME_PAYLOAD:-16384}"
+DEFAULT_PADDING_MIN="${KNODE_PADDING_MIN:-0}"
+DEFAULT_PADDING_MAX="${KNODE_PADDING_MAX:-0}"
+DEFAULT_HANDSHAKE_TIMEOUT="${KNODE_HANDSHAKE_TIMEOUT:-10s}"
 
 log() {
   printf '[knode-install] %s\n' "$*"
@@ -49,6 +60,7 @@ Kboard/env integration:
   KNODE_TRANSPORT            tcp, tls, httpupgrade, websocket, httpstream, grpc, xhttp
   KNODE_UPSTREAM_ADDR        kray address for tcp/tls, default: 127.0.0.1:9000
   KNODE_UPSTREAM_URL         kray URL for HTTP/WebSocket transports
+  KNODE_HEADERS_JSON         optional JSON object for upstream request headers
   KNODE_INBOUND_LISTEN       local TCP listen address, default: 127.0.0.1:7000
   KNODE_ADMIN_ADDR           admin listen address, default: 127.0.0.1:8080
   KNODE_CONFIG               config path, default: /etc/knode/knode.json
@@ -218,6 +230,20 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+env_config_available() {
+  [ -n "${KNODE_CLIENT_SECRET:-}" ] && [ -n "${KNODE_SERVER_SIGNING_KEY:-}" ]
+}
+
+ensure_uint() {
+  local value="$1"
+  local name="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      die "${name} must be a non-negative integer"
+      ;;
+  esac
+}
+
 endpoint_json() {
   case "$DEFAULT_UPSTREAM_TRANSPORT" in
     tcp|tls)
@@ -230,19 +256,78 @@ endpoint_json() {
   esac
 }
 
+upstream_optional_json() {
+  if [ -n "$DEFAULT_SERVER_NAME" ]; then
+    printf '      "server_name": "%s",\n' "$(json_escape "$DEFAULT_SERVER_NAME")"
+  fi
+  if [ -n "$DEFAULT_CA_FILE" ]; then
+    printf '      "ca_file": "%s",\n' "$(json_escape "$DEFAULT_CA_FILE")"
+  fi
+  case "$DEFAULT_INSECURE_SKIP_VERIFY" in
+    true|false)
+      printf '      "insecure_skip_verify": %s,\n' "$DEFAULT_INSECURE_SKIP_VERIFY"
+      ;;
+    *)
+      die "KNODE_INSECURE_SKIP_VERIFY must be true or false"
+      ;;
+  esac
+  if [ -n "$DEFAULT_HEADERS_JSON" ]; then
+    printf '      "headers": %s,\n' "$DEFAULT_HEADERS_JSON"
+  fi
+}
+
+capabilities_json() {
+  local raw item first old_ifs
+  raw="$DEFAULT_KLESS_CAPABILITIES"
+  [ -n "$raw" ] || return 0
+  case "$raw" in
+    \[*\])
+      printf '%s' "$raw"
+      return
+      ;;
+  esac
+
+  first=1
+  printf '['
+  old_ifs="$IFS"
+  IFS=','
+  for item in $raw; do
+    item="$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "$item" ] || continue
+    if [ "$first" -eq 0 ]; then
+      printf ', '
+    fi
+    printf '"%s"' "$(json_escape "$item")"
+    first=0
+  done
+  IFS="$old_ifs"
+  printf ']'
+}
+
+kless_optional_json() {
+  if [ -n "$DEFAULT_KLESS_CAPABILITIES" ]; then
+    printf '        "capabilities": %s,\n' "$(capabilities_json)"
+  fi
+}
+
+backup_config() {
+  local backup
+  backup="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+  cp -a "$CONFIG_PATH" "$backup"
+  log "backed up existing config to ${backup}"
+}
+
 write_env_config() {
   local dir endpoint client_id
   dir="$(dirname "$CONFIG_PATH")"
   client_id="${KNODE_CLIENT_ID:-$DEFAULT_NODE_ID}"
 
-  [ -n "${KNODE_CLIENT_SECRET:-}" ] || return 1
-  [ -n "${KNODE_SERVER_SIGNING_KEY:-}" ] || return 1
+  env_config_available || return 1
+  ensure_uint "$DEFAULT_MAX_CONNECTIONS" "KNODE_MAX_CONNECTIONS"
+  ensure_uint "$DEFAULT_MAX_FRAME_PAYLOAD" "KNODE_MAX_FRAME_PAYLOAD"
+  ensure_uint "$DEFAULT_PADDING_MIN" "KNODE_PADDING_MIN"
+  ensure_uint "$DEFAULT_PADDING_MAX" "KNODE_PADDING_MAX"
   endpoint="$(endpoint_json)"
-  case "$DEFAULT_MAX_CONNECTIONS" in
-    ''|*[!0-9]*)
-      die "KNODE_MAX_CONNECTIONS must be a positive integer"
-      ;;
-  esac
 
   install -d -m 0755 "$dir"
   cat > "$CONFIG_PATH" <<EOF
@@ -251,19 +336,21 @@ write_env_config() {
   "admin": {
     "address": "$(json_escape "$DEFAULT_ADMIN_ADDR")"
   },
-  "shutdown_grace": "10s",
+  "shutdown_grace": "$(json_escape "$DEFAULT_SHUTDOWN_GRACE")",
   "upstreams": [
     {
       "name": "$(json_escape "$DEFAULT_UPSTREAM_NAME")",
       "transport": "$(json_escape "$DEFAULT_UPSTREAM_TRANSPORT")",
       ${endpoint},
-      "dial_timeout": "10s",
+$(upstream_optional_json)      "dial_timeout": "$(json_escape "$DEFAULT_DIAL_TIMEOUT")",
       "kless": {
         "client_id": "$(json_escape "$client_id")",
         "client_secret": "$(json_escape "$KNODE_CLIENT_SECRET")",
         "server_signing_key": "$(json_escape "$KNODE_SERVER_SIGNING_KEY")",
-        "max_frame_payload": 16384,
-        "handshake_timeout": "10s"
+$(kless_optional_json)        "max_frame_payload": ${DEFAULT_MAX_FRAME_PAYLOAD},
+        "padding_min": ${DEFAULT_PADDING_MIN},
+        "padding_max": ${DEFAULT_PADDING_MAX},
+        "handshake_timeout": "$(json_escape "$DEFAULT_HANDSHAKE_TIMEOUT")"
       }
     }
   ],
@@ -282,7 +369,18 @@ EOF
 
 ensure_config() {
   if [ -f "$CONFIG_PATH" ]; then
-    log "keeping existing config ${CONFIG_PATH}"
+    if config_ready; then
+      log "keeping existing config ${CONFIG_PATH}"
+      return
+    fi
+    if env_config_available; then
+      backup_config
+      write_env_config
+      log "recreated config from environment: ${CONFIG_PATH}"
+      return
+    fi
+    log "existing config is not ready: ${CONFIG_PATH}"
+    log "keeping it because Kboard/KNODE secret env is incomplete"
     return
   fi
 
