@@ -23,6 +23,29 @@ go run ./cmd/knode check -config knode.json
 go run ./cmd/knode run -config knode.json
 ```
 
+## 一键安装
+
+Linux 节点可以直接使用仓库中的 `install.sh` 安装最新 GitHub Release：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kexue-aihao/Knode/master/install.sh | sudo bash
+```
+
+升级到最新 Release：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kexue-aihao/Knode/master/install.sh | sudo bash -s -- upgrade
+```
+
+对接 Kboard 时可以通过环境变量下发 KLESS 配置：
+
+```bash
+KNODE_CLIENT_SECRET="..." \
+KNODE_SERVER_SIGNING_KEY="..." \
+KNODE_UPSTREAM_ADDR="127.0.0.1:9000" \
+sudo -E bash install.sh install
+```
+
 `gen-keys` 会输出服务端 Ed25519 公私钥和客户端 secret。Knode 配置中使用
 `server_signing_public` 作为 `server_signing_key`，kray 服务端使用对应私钥。
 
