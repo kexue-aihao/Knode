@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build release assets
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist build
+          version="${RELEASE_TAG}"
+          commit="${GITHUB_SHA}"
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X main.version=${version} -X main.commit=${commit} -X main.date=${date}"
+
+          build_one() {
+            local goos="$1"
+            local goarch="$2"
+            local suffix="$3"
+            local goarm="${4:-}"
+            local gomips="${5:-}"
+            local asset="knode-${suffix}.zip"
+            local bin="knode"
+
+            rm -rf build/*
+            if [[ "${goos}" == "windows" ]]; then
+              bin="knode.exe"
+            fi
+
+            echo "building ${asset}"
+            env \
+              CGO_ENABLED=0 \
+              GOOS="${goos}" \
+              GOARCH="${goarch}" \
+              GOARM="${goarm}" \
+              GOMIPS="${gomips}" \
+              go build -trimpath -ldflags "${ldflags}" -o "build/${bin}" ./cmd/knode
+
+            (cd build && zip -9 "../dist/${asset}" "${bin}")
+            sha256sum "dist/${asset}" > "dist/${asset}.dgst"
+            sha512sum "dist/${asset}" >> "dist/${asset}.dgst"
+          }
+
+          build_one android arm64 android-arm64-v8a
+          build_one freebsd 386 freebsd-32
+          build_one freebsd amd64 freebsd-64
+          build_one freebsd arm freebsd-arm32-v7a 7
+          build_one freebsd arm64 freebsd-arm64-v8a
+          build_one linux 386 linux-32
+          build_one linux amd64 linux-64
+          build_one linux arm linux-arm32-v5 5
+          build_one linux arm linux-arm32-v6 6
+          build_one linux arm linux-arm32-v7a 7
+          build_one linux arm64 linux-arm64-v8a
+          build_one linux mips linux-mips32 "" softfloat
+          build_one linux mipsle linux-mips32le "" softfloat
+          build_one linux mips64 linux-mips64 "" softfloat
+          build_one linux mips64le linux-mips64le "" softfloat
+          build_one linux ppc64 linux-ppc64
+          build_one linux ppc64le linux-ppc64le
+          build_one linux riscv64 linux-riscv64
+          build_one linux s390x linux-s390x
+          build_one darwin amd64 macos-64
+          build_one darwin arm64 macos-arm64-v8a
+          build_one windows 386 windows-32
+          build_one windows amd64 windows-64
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" dist/* \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_TAG}" \
+              --generate-notes
+          fi
