@@ -124,6 +124,104 @@ func TestConfigValidateAcceptsKboardControlConfig(t *testing.T) {
 	}
 }
 
+func TestConfigValidateAcceptsKLESSServerInbound(t *testing.T) {
+	serverPublic, serverPrivate, err := kless.GenerateServerIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSecret, err := kless.GenerateClientSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		NodeID: "knode-relay",
+		Inbounds: []config.InboundConfig{
+			{
+				Name:   "public-kless",
+				Listen: "0.0.0.0:443",
+				Mode:   config.InboundModeKLESSServer,
+				KLESS: config.ServerKLESSConfig{
+					ClientID:             "client-a",
+					ClientSecret:         base64.RawURLEncoding.EncodeToString(clientSecret),
+					ServerSigningKey:     base64.RawURLEncoding.EncodeToString(serverPublic),
+					ServerSigningPrivate: base64.RawURLEncoding.EncodeToString(serverPrivate),
+				},
+			},
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestConfigValidateRejectsMixedKLESSSecretMaterial(t *testing.T) {
+	serverPublic, _, err := kless.GenerateServerIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		NodeID: "knode-a",
+		Upstreams: []config.UpstreamConfig{
+			{
+				Name:      "primary",
+				Transport: config.TransportTCP,
+				Address:   "127.0.0.1:9000",
+				KLESS: config.KLESSConfig{
+					ClientID:         "knode-a",
+					ClientSecret:     kless.EncodeKey(serverPublic),
+					ServerSigningKey: kless.EncodeKey(serverPublic),
+				},
+			},
+		},
+		Inbounds: []config.InboundConfig{
+			{Name: "local", Listen: "127.0.0.1:7000", Upstream: "primary"},
+		},
+	}
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want error")
+	}
+}
+
+func TestConfigValidateRejectsMismatchedKLESSServerPrivateKey(t *testing.T) {
+	serverPublic, _, err := kless.GenerateServerIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, serverPrivate, err := kless.GenerateServerIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSecret, err := kless.GenerateClientSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		NodeID: "knode-relay",
+		Inbounds: []config.InboundConfig{
+			{
+				Name:   "public-kless",
+				Listen: "0.0.0.0:443",
+				Mode:   config.InboundModeKLESSServer,
+				KLESS: config.ServerKLESSConfig{
+					ClientID:             "client-a",
+					ClientSecret:         kless.EncodeKey(clientSecret),
+					ServerSigningKey:     kless.EncodeKey(serverPublic),
+					ServerSigningPrivate: kless.EncodeKey(serverPrivate),
+				},
+			},
+		},
+	}
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want error")
+	}
+}
+
 func TestConfigValidateRejectsUnknownUpstream(t *testing.T) {
 	serverPublic, _, err := kless.GenerateServerIdentity()
 	if err != nil {

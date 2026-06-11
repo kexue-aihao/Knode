@@ -79,7 +79,7 @@ func TestKboardReporterAliveUsesKboardProtocol(t *testing.T) {
 		AliveEndpoint:    "/kb-prefix/knode/control/alive?source=test",
 	}, "kboard-node-2", log.New(io.Discard, "", 0), func() Status {
 		return Status{Metrics: MetricsSnapshot{Active: 7}}
-	})
+	}, nil)
 
 	reporter.reportAlive(context.Background())
 
@@ -134,7 +134,7 @@ func TestKboardReporterTrafficUsesEmptyBatch(t *testing.T) {
 		TrafficEndpoint:  "/kb-prefix/knode/control/traffic",
 	}, "kboard-node-2", log.New(io.Discard, "", 0), func() Status {
 		return Status{}
-	})
+	}, nil)
 
 	reporter.reportTraffic(context.Background())
 
@@ -157,10 +157,70 @@ func TestKboardReporterTrafficUsesEmptyBatch(t *testing.T) {
 	}
 }
 
-func verifyKboardRequest(r *http.Request, secret, nodeID string) error {
-	if r.Method != http.MethodPost {
-		return fmt.Errorf("method = %s", r.Method)
+func TestKboardReporterSyncUsersUpdatesDynamicClientStore(t *testing.T) {
+	const (
+		nodeID = "2"
+		secret = "test-node-shared-secret"
+	)
+
+	clientSecret := []byte("01234567890123456789012345678901")
+	errCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			errCh <- fmt.Errorf("method = %s", r.Method)
+			http.Error(w, "bad method", http.StatusBadRequest)
+			return
+		}
+		if err := verifyKboardRequest(r, secret, nodeID); err != nil {
+			errCh <- err
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocol_version": "kboard-knode-control/1",
+			"node_id":          2,
+			"users": []map[string]any{
+				{
+					"id":            1001,
+					"uuid":          "user-uuid",
+					"client_secret": encodeClientSecret(clientSecret),
+				},
+			},
+			"count": 1,
+		})
+	}))
+	defer server.Close()
+
+	store := newDynamicClientStore()
+	reporter := newKboardReporter(config.KboardConfig{
+		PublicURL:        server.URL,
+		NodeID:           nodeID,
+		NodeSharedSecret: secret,
+		UsersEndpoint:    "/kb-prefix/knode/control/users",
+	}, "kboard-node-2", log.New(io.Discard, "", 0), func() Status {
+		return Status{}
+	}, store)
+
+	reporter.syncUsers(context.Background())
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
 	}
+	got, ok := store.LookupClientSecret("user-uuid")
+	if !ok {
+		t.Fatal("client secret not loaded")
+	}
+	if string(got) != string(clientSecret) {
+		t.Fatalf("client secret = %q, want %q", got, clientSecret)
+	}
+	if userID := store.UserID("user-uuid"); userID != 1001 {
+		t.Fatalf("user id = %d, want 1001", userID)
+	}
+}
+
+func verifyKboardRequest(r *http.Request, secret, nodeID string) error {
 	if got := r.Header.Get("X-KBoard-Node-ID"); got != nodeID {
 		return fmt.Errorf("node header = %q", got)
 	}

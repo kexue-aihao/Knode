@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -31,6 +32,8 @@ const (
 	TransportGRPC           = "grpc"
 	TransportXHTTP          = "xhttp"
 	TransportHTTP3          = "http3"
+	InboundModeTCP          = "tcp"
+	InboundModeKLESSServer  = "kless-server"
 )
 
 type Config struct {
@@ -72,21 +75,44 @@ type UpstreamConfig struct {
 }
 
 type KLESSConfig struct {
-	ClientID         string   `json:"client_id"`
-	ClientSecret     string   `json:"client_secret"`
-	ServerSigningKey string   `json:"server_signing_key"`
-	Capabilities     []string `json:"capabilities,omitempty"`
-	MaxFramePayload  int      `json:"max_frame_payload,omitempty"`
-	PaddingMin       int      `json:"padding_min,omitempty"`
-	PaddingMax       int      `json:"padding_max,omitempty"`
-	HandshakeTimeout string   `json:"handshake_timeout,omitempty"`
+	ClientID             string   `json:"client_id"`
+	ClientSecret         string   `json:"client_secret"`
+	ServerSigningKey     string   `json:"server_signing_key"`
+	ServerSigningPrivate string   `json:"server_signing_private,omitempty"`
+	Capabilities         []string `json:"capabilities,omitempty"`
+	MaxFramePayload      int      `json:"max_frame_payload,omitempty"`
+	PaddingMin           int      `json:"padding_min,omitempty"`
+	PaddingMax           int      `json:"padding_max,omitempty"`
+	HandshakeTimeout     string   `json:"handshake_timeout,omitempty"`
 }
 
 type InboundConfig struct {
-	Name           string `json:"name"`
-	Listen         string `json:"listen"`
-	Upstream       string `json:"upstream"`
-	MaxConnections int    `json:"max_connections,omitempty"`
+	Name           string            `json:"name"`
+	Listen         string            `json:"listen"`
+	Mode           string            `json:"mode,omitempty"`
+	Upstream       string            `json:"upstream,omitempty"`
+	MaxConnections int               `json:"max_connections,omitempty"`
+	KLESS          ServerKLESSConfig `json:"kless,omitempty"`
+}
+
+type ServerKLESSConfig struct {
+	ClientID             string                    `json:"client_id,omitempty"`
+	ClientSecret         string                    `json:"client_secret,omitempty"`
+	ServerSigningKey     string                    `json:"server_signing_key,omitempty"`
+	ServerSigningPrivate string                    `json:"server_signing_private"`
+	Clients              []ServerKLESSClientConfig `json:"clients,omitempty"`
+	Capabilities         []string                  `json:"capabilities,omitempty"`
+	MaxFramePayload      int                       `json:"max_frame_payload,omitempty"`
+	PaddingMin           int                       `json:"padding_min,omitempty"`
+	PaddingMax           int                       `json:"padding_max,omitempty"`
+	HandshakeTimeout     string                    `json:"handshake_timeout,omitempty"`
+	MaxHandshakeSkew     string                    `json:"max_handshake_skew,omitempty"`
+	UsersRefreshInterval string                    `json:"users_refresh_interval,omitempty"`
+}
+
+type ServerKLESSClientConfig struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
 }
 
 func Load(path string) (Config, error) {
@@ -120,9 +146,6 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.NodeID) == "" {
 		return errors.New("node_id is required")
 	}
-	if len(c.Upstreams) == 0 {
-		return errors.New("at least one upstream is required")
-	}
 	if len(c.Inbounds) == 0 {
 		return errors.New("at least one inbound is required")
 	}
@@ -148,8 +171,9 @@ func (c *Config) Validate() error {
 	}
 
 	inbounds := make(map[string]struct{}, len(c.Inbounds))
+	allowDynamicUsers := c.Kboard != nil && c.Kboard.UsersEndpoint != ""
 	for i := range c.Inbounds {
-		if err := c.Inbounds[i].Validate(upstreams); err != nil {
+		if err := c.Inbounds[i].Validate(upstreams, allowDynamicUsers); err != nil {
 			return fmt.Errorf("inbounds[%d]: %w", i, err)
 		}
 		name := c.Inbounds[i].Name
@@ -246,6 +270,9 @@ func (k *KLESSConfig) Validate(transport string) error {
 	if k.ClientID == "" {
 		return errors.New("client_id is required")
 	}
+	if sameNonEmptySecret(k.ClientSecret, k.ServerSigningKey) {
+		return errors.New("client_secret must not equal server_signing_key")
+	}
 	secret, err := k.ClientSecretBytes()
 	if err != nil {
 		return fmt.Errorf("client_secret: %w", err)
@@ -257,8 +284,20 @@ func (k *KLESSConfig) Validate(transport string) error {
 	if err != nil {
 		return fmt.Errorf("server_signing_key: %w", err)
 	}
+	if bytes.Equal(secret, signingKey) {
+		return errors.New("client_secret must not decode to server_signing_key")
+	}
 	if len(signingKey) != ed25519.PublicKeySize {
 		return fmt.Errorf("server_signing_key must decode to %d bytes", ed25519.PublicKeySize)
+	}
+	if k.ServerSigningPrivate != "" {
+		privateKey, err := k.ServerSigningPrivateBytes()
+		if err != nil {
+			return fmt.Errorf("server_signing_private: %w", err)
+		}
+		if !publicMatchesPrivate(signingKey, privateKey) {
+			return errors.New("server_signing_private does not match server_signing_key")
+		}
 	}
 	if k.MaxFramePayload < 0 {
 		return errors.New("max_frame_payload cannot be negative")
@@ -312,8 +351,161 @@ func (k KLESSConfig) ServerSigningKeyBytes() ([]byte, error) {
 	return decodeKey(k.ServerSigningKey)
 }
 
+func (k KLESSConfig) ServerSigningPrivateBytes() (ed25519.PrivateKey, error) {
+	key, err := decodeKey(k.ServerSigningPrivate)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("must decode to %d bytes", ed25519.PrivateKeySize)
+	}
+	return ed25519.PrivateKey(key), nil
+}
+
+func (k *ServerKLESSConfig) Validate(allowDynamicUsers bool) error {
+	k.applyDefaults()
+	privateKey, err := k.ServerSigningPrivateBytes()
+	if err != nil {
+		return fmt.Errorf("server_signing_private: %w", err)
+	}
+	if k.ServerSigningKey != "" {
+		publicKey, err := k.ServerSigningKeyBytes()
+		if err != nil {
+			return fmt.Errorf("server_signing_key: %w", err)
+		}
+		if !publicMatchesPrivate(publicKey, privateKey) {
+			return errors.New("server_signing_private does not match server_signing_key")
+		}
+	}
+	hasClientSecret := strings.TrimSpace(k.ClientSecret) != ""
+	hasStaticClient := strings.TrimSpace(k.ClientID) != "" && hasClientSecret
+	if hasClientSecret {
+		if sameNonEmptySecret(k.ClientSecret, k.ServerSigningKey) {
+			return errors.New("client_secret must not equal server_signing_key")
+		}
+		secret, err := k.ClientSecretBytes()
+		if err != nil {
+			return fmt.Errorf("client_secret: %w", err)
+		}
+		if len(secret) < 32 {
+			return errors.New("client_secret must decode to at least 32 bytes")
+		}
+		if k.ServerSigningKey != "" {
+			signingKey, err := k.ServerSigningKeyBytes()
+			if err != nil {
+				return fmt.Errorf("server_signing_key: %w", err)
+			}
+			if bytes.Equal(secret, signingKey) {
+				return errors.New("client_secret must not decode to server_signing_key")
+			}
+		}
+		if strings.TrimSpace(k.ClientID) == "" && !allowDynamicUsers {
+			return errors.New("client_id is required when client_secret is used without kboard users_endpoint")
+		}
+	}
+	for i := range k.Clients {
+		if err := k.Clients[i].Validate(); err != nil {
+			return fmt.Errorf("clients[%d]: %w", i, err)
+		}
+	}
+	if !hasStaticClient && len(k.Clients) == 0 && !allowDynamicUsers {
+		return errors.New("client_id/client_secret, clients, or kboard users_endpoint is required")
+	}
+	if k.MaxFramePayload < 0 {
+		return errors.New("max_frame_payload cannot be negative")
+	}
+	if k.PaddingMin < 0 || k.PaddingMax < 0 || k.PaddingMin > k.PaddingMax || k.PaddingMax > kless.MaxHandshakePadding {
+		return fmt.Errorf("padding must satisfy 0 <= min <= max <= %d", kless.MaxHandshakePadding)
+	}
+	if _, err := parseDuration(k.HandshakeTimeout, DefaultHandshakeTimeout); err != nil {
+		return fmt.Errorf("handshake_timeout: %w", err)
+	}
+	if _, err := parseDuration(k.MaxHandshakeSkew, kless.DefaultHandshakeSkew); err != nil {
+		return fmt.Errorf("max_handshake_skew: %w", err)
+	}
+	if _, err := parseDuration(k.UsersRefreshInterval, 5*time.Minute); err != nil {
+		return fmt.Errorf("users_refresh_interval: %w", err)
+	}
+	if _, err := capabilityMaskForNames(k.Capabilities); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (k ServerKLESSConfig) ClientSecretBytes() ([]byte, error) {
+	return decodeKey(k.ClientSecret)
+}
+
+func (k ServerKLESSConfig) ServerSigningKeyBytes() (ed25519.PublicKey, error) {
+	key, err := decodeKey(k.ServerSigningKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("must decode to %d bytes", ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(key), nil
+}
+
+func (k ServerKLESSConfig) ServerSigningPrivateBytes() (ed25519.PrivateKey, error) {
+	key, err := decodeKey(k.ServerSigningPrivate)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("must decode to %d bytes", ed25519.PrivateKeySize)
+	}
+	return ed25519.PrivateKey(key), nil
+}
+
+func (k ServerKLESSConfig) CapabilityMask() (kless.Capability, error) {
+	return capabilityMaskForNames(k.Capabilities)
+}
+
+func (k ServerKLESSConfig) HandshakeTimeoutDuration() time.Duration {
+	d, _ := parseDuration(k.HandshakeTimeout, DefaultHandshakeTimeout)
+	return d
+}
+
+func (k ServerKLESSConfig) MaxHandshakeSkewDuration() time.Duration {
+	d, _ := parseDuration(k.MaxHandshakeSkew, kless.DefaultHandshakeSkew)
+	return d
+}
+
+func (k ServerKLESSConfig) UsersRefreshIntervalDuration() time.Duration {
+	d, _ := parseDuration(k.UsersRefreshInterval, 5*time.Minute)
+	return d
+}
+
+func (c *ServerKLESSClientConfig) Validate() error {
+	c.ClientID = strings.TrimSpace(c.ClientID)
+	c.ClientSecret = strings.TrimSpace(c.ClientSecret)
+	if c.ClientID == "" {
+		return errors.New("client_id is required")
+	}
+	secret, err := decodeKey(c.ClientSecret)
+	if err != nil {
+		return fmt.Errorf("client_secret: %w", err)
+	}
+	if len(secret) < 32 {
+		return errors.New("client_secret must decode to at least 32 bytes")
+	}
+	return nil
+}
+
+func (c ServerKLESSClientConfig) ClientSecretBytes() ([]byte, error) {
+	return decodeKey(c.ClientSecret)
+}
+
 func decodeKey(text string) ([]byte, error) {
-	text = strings.TrimSpace(text)
+	text = strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			return -1
+		default:
+			return r
+		}
+	}, strings.TrimSpace(text))
 	encodings := []*base64.Encoding{
 		base64.RawStdEncoding,
 		base64.StdEncoding,
@@ -333,9 +525,10 @@ func decodeKey(text string) ([]byte, error) {
 	return nil, firstErr
 }
 
-func (i *InboundConfig) Validate(upstreams map[string]struct{}) error {
+func (i *InboundConfig) Validate(upstreams map[string]struct{}, allowDynamicUsers bool) error {
 	i.Name = strings.TrimSpace(i.Name)
 	i.Listen = strings.TrimSpace(i.Listen)
+	i.Mode = normalizeInboundMode(i.Mode)
 	i.Upstream = strings.TrimSpace(i.Upstream)
 	if i.Name == "" {
 		return errors.New("name is required")
@@ -343,11 +536,23 @@ func (i *InboundConfig) Validate(upstreams map[string]struct{}) error {
 	if i.Listen == "" {
 		return errors.New("listen is required")
 	}
-	if i.Upstream == "" {
-		return errors.New("upstream is required")
-	}
-	if _, ok := upstreams[i.Upstream]; !ok {
-		return fmt.Errorf("unknown upstream %q", i.Upstream)
+	switch i.Mode {
+	case InboundModeTCP:
+		if len(upstreams) == 0 {
+			return errors.New("at least one upstream is required for tcp inbound")
+		}
+		if i.Upstream == "" {
+			return errors.New("upstream is required")
+		}
+		if _, ok := upstreams[i.Upstream]; !ok {
+			return fmt.Errorf("unknown upstream %q", i.Upstream)
+		}
+	case InboundModeKLESSServer:
+		if err := i.KLESS.Validate(allowDynamicUsers); err != nil {
+			return fmt.Errorf("kless: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported inbound mode %q", i.Mode)
 	}
 	if i.MaxConnections < 0 {
 		return errors.New("max_connections cannot be negative")
@@ -365,6 +570,9 @@ func (c *Config) applyDefaults() {
 	}
 	for i := range c.Upstreams {
 		c.Upstreams[i].applyDefaults()
+	}
+	for i := range c.Inbounds {
+		c.Inbounds[i].applyDefaults()
 	}
 	if c.Kboard != nil {
 		c.Kboard.applyDefaults()
@@ -414,6 +622,30 @@ func (u *UpstreamConfig) applyDefaults() {
 	}
 }
 
+func (i *InboundConfig) applyDefaults() {
+	i.Name = strings.TrimSpace(i.Name)
+	i.Listen = strings.TrimSpace(i.Listen)
+	i.Mode = normalizeInboundMode(i.Mode)
+	i.Upstream = strings.TrimSpace(i.Upstream)
+	i.KLESS.applyDefaults()
+}
+
+func (k *ServerKLESSConfig) applyDefaults() {
+	k.ClientID = strings.TrimSpace(k.ClientID)
+	k.ClientSecret = strings.TrimSpace(k.ClientSecret)
+	k.ServerSigningKey = strings.TrimSpace(k.ServerSigningKey)
+	k.ServerSigningPrivate = strings.TrimSpace(k.ServerSigningPrivate)
+	if k.HandshakeTimeout == "" {
+		k.HandshakeTimeout = DefaultHandshakeTimeout.String()
+	}
+	if k.MaxHandshakeSkew == "" {
+		k.MaxHandshakeSkew = kless.DefaultHandshakeSkew.String()
+	}
+	if k.UsersRefreshInterval == "" {
+		k.UsersRefreshInterval = (5 * time.Minute).String()
+	}
+}
+
 func capabilityMask(transport string, names []string) (kless.Capability, error) {
 	if len(names) == 0 {
 		return capabilityForTransport(transport)
@@ -425,6 +657,32 @@ func capabilityMask(transport string, names []string) (kless.Capability, error) 
 			return 0, err
 		}
 		caps |= capability
+	}
+	return caps, nil
+}
+
+func capabilityMaskForNames(names []string) (kless.Capability, error) {
+	if len(names) == 0 {
+		return kless.CapabilityAll, nil
+	}
+	var caps kless.Capability
+	for _, name := range names {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		if name == "all" {
+			caps |= kless.CapabilityAll
+			continue
+		}
+		capability, err := capabilityForTransport(name)
+		if err != nil {
+			return 0, err
+		}
+		caps |= capability
+	}
+	if caps == 0 {
+		return 0, errors.New("at least one capability is required")
 	}
 	return caps, nil
 }
@@ -450,6 +708,28 @@ func capabilityForTransport(transport string) (kless.Capability, error) {
 	default:
 		return 0, fmt.Errorf("unsupported capability %q", transport)
 	}
+}
+
+func normalizeInboundMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", InboundModeTCP, "client", "client-forward", "forward":
+		return InboundModeTCP
+	case InboundModeKLESSServer, "kless_server", "server", "relay", "server-relay":
+		return InboundModeKLESSServer
+	default:
+		return strings.ToLower(strings.TrimSpace(mode))
+	}
+}
+
+func sameNonEmptySecret(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	return a != "" && b != "" && a == b
+}
+
+func publicMatchesPrivate(public ed25519.PublicKey, private ed25519.PrivateKey) bool {
+	derived, ok := private.Public().(ed25519.PublicKey)
+	return ok && bytes.Equal(public, derived)
 }
 
 func isSupportedTransport(transport string) bool {

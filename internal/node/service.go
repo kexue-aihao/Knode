@@ -22,6 +22,7 @@ type Service struct {
 	metrics *Metrics
 
 	dialers map[string]*UpstreamDialer
+	relays  map[string]*serverRelay
 
 	mu               sync.RWMutex
 	adminAddr        string
@@ -54,12 +55,29 @@ func New(cfg config.Config, logger *log.Logger) (*Service, error) {
 		}
 		dialers[upstream.Name] = dialer
 	}
+	userStore := newDynamicClientStore()
+	metrics := NewMetrics()
+	relays := make(map[string]*serverRelay)
+	for _, inbound := range cfg.Inbounds {
+		if inbound.Mode != config.InboundModeKLESSServer {
+			continue
+		}
+		if err := requireKLESSServerRelay(inbound); err != nil {
+			return nil, err
+		}
+		relay, err := newServerRelay(inbound.Name, inbound.KLESS, logger, metrics, userStore)
+		if err != nil {
+			return nil, fmt.Errorf("inbound %q: %w", inbound.Name, err)
+		}
+		relays[inbound.Name] = relay
+	}
 
 	return &Service{
 		cfg:          cfg,
 		logger:       logger,
-		metrics:      NewMetrics(),
+		metrics:      metrics,
 		dialers:      dialers,
+		relays:       relays,
 		inboundAddrs: make(map[string]string, len(cfg.Inbounds)),
 	}, nil
 }
@@ -113,7 +131,12 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if s.cfg.Kboard != nil {
-		reporter := newKboardReporter(*s.cfg.Kboard, s.cfg.NodeID, s.logger, s.Status)
+		var userStore *dynamicClientStore
+		for _, relay := range s.relays {
+			userStore = relay.store
+			break
+		}
+		reporter := newKboardReporter(*s.cfg.Kboard, s.cfg.NodeID, s.logger, s.Status, userStore)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -219,6 +242,17 @@ func (s *Service) handleConnection(ctx context.Context, inbound config.InboundCo
 	s.metrics.beginConnection()
 	defer s.metrics.endConnection()
 	defer local.Close()
+
+	if inbound.Mode == config.InboundModeKLESSServer {
+		relay := s.relays[inbound.Name]
+		if relay == nil {
+			s.metrics.addProxyError()
+			s.logger.Printf("inbound %s has no kless server relay", inbound.Name)
+			return
+		}
+		relay.Handle(ctx, local)
+		return
+	}
 
 	dialer := s.dialers[inbound.Upstream]
 	secure, err := dialer.Dial(ctx)

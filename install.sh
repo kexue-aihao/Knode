@@ -19,6 +19,7 @@ DEFAULT_ADMIN_ADDR="${KNODE_ADMIN_ADDR:-127.0.0.1:8080}"
 DEFAULT_SHUTDOWN_GRACE="${KNODE_SHUTDOWN_GRACE:-10s}"
 DEFAULT_INBOUND_NAME="${KNODE_INBOUND_NAME:-local-tcp}"
 DEFAULT_INBOUND_LISTEN="${KNODE_INBOUND_LISTEN:-127.0.0.1:7000}"
+DEFAULT_INBOUND_MODE="${KNODE_INBOUND_MODE:-${KNODE_MODE:-tcp}}"
 DEFAULT_MAX_CONNECTIONS="${KNODE_MAX_CONNECTIONS:-1024}"
 DEFAULT_UPSTREAM_NAME="${KNODE_UPSTREAM_NAME:-kray-primary}"
 DEFAULT_UPSTREAM_TRANSPORT="${KNODE_TRANSPORT:-tcp}"
@@ -34,6 +35,8 @@ DEFAULT_MAX_FRAME_PAYLOAD="${KNODE_MAX_FRAME_PAYLOAD:-16384}"
 DEFAULT_PADDING_MIN="${KNODE_PADDING_MIN:-0}"
 DEFAULT_PADDING_MAX="${KNODE_PADDING_MAX:-0}"
 DEFAULT_HANDSHAKE_TIMEOUT="${KNODE_HANDSHAKE_TIMEOUT:-10s}"
+DEFAULT_MAX_HANDSHAKE_SKEW="${KNODE_MAX_HANDSHAKE_SKEW:-2m0s}"
+DEFAULT_USERS_REFRESH_INTERVAL="${KNODE_USERS_REFRESH_INTERVAL:-5m0s}"
 
 KBOARD_PUBLIC_URL="${KBOARD_PUBLIC_URL:-}"
 KBOARD_API_PREFIX="${KBOARD_API_PREFIX:-}"
@@ -75,6 +78,9 @@ Kboard/env integration:
   KNODE_CLIENT_ID            KLESS client id, default: knode-a
   KNODE_CLIENT_SECRET        KLESS client secret from kray/Kboard
   KNODE_SERVER_SIGNING_KEY   kray Ed25519 public signing key
+  KNODE_SERVER_SIGNING_PRIVATE
+                            Ed25519 private key for KNODE_INBOUND_MODE=kless-server
+  KNODE_INBOUND_MODE         tcp or kless-server, default: tcp
   KNODE_TRANSPORT            tcp, tls, httpupgrade, websocket, httpstream, grpc, xhttp
   KNODE_UPSTREAM_ADDR        kray address for tcp/tls, default: 127.0.0.1:9000
   KNODE_UPSTREAM_URL         kray URL for HTTP/WebSocket transports
@@ -289,6 +295,32 @@ ensure_uint() {
   esac
 }
 
+normalize_inbound_mode() {
+  case "$(printf '%s' "$DEFAULT_INBOUND_MODE" | tr '[:upper:]' '[:lower:]')" in
+    ''|tcp|client|client-forward|forward)
+      printf 'tcp'
+      ;;
+    kless-server|kless_server|server|relay|server-relay)
+      printf 'kless-server'
+      ;;
+    *)
+      die "KNODE_INBOUND_MODE must be tcp or kless-server"
+      ;;
+  esac
+}
+
+ensure_kless_material() {
+  [ -n "${KNODE_CLIENT_ID:-}" ] || [ -n "$DEFAULT_NODE_ID" ] || die "KNODE_CLIENT_ID must not be empty"
+  [ -n "${KNODE_CLIENT_SECRET:-}" ] || die "KNODE_CLIENT_SECRET is required"
+  [ -n "${KNODE_SERVER_SIGNING_KEY:-}" ] || die "KNODE_SERVER_SIGNING_KEY is required"
+  if [ "$KNODE_CLIENT_SECRET" = "$KNODE_SERVER_SIGNING_KEY" ]; then
+    die "KNODE_CLIENT_SECRET must not equal KNODE_SERVER_SIGNING_KEY"
+  fi
+  if [ "$(normalize_inbound_mode)" = "kless-server" ] && [ -z "${KNODE_SERVER_SIGNING_PRIVATE:-}" ]; then
+    die "KNODE_SERVER_SIGNING_PRIVATE is required for KNODE_INBOUND_MODE=kless-server"
+  fi
+}
+
 endpoint_json() {
   case "$DEFAULT_UPSTREAM_TRANSPORT" in
     tcp|tls)
@@ -299,6 +331,34 @@ endpoint_json() {
       printf '"url": "%s"' "$(json_escape "$DEFAULT_UPSTREAM_URL")"
       ;;
   esac
+}
+
+upstreams_json() {
+  local endpoint
+  if [ "$(normalize_inbound_mode)" = "kless-server" ]; then
+    printf '  "upstreams": [],\n'
+    return
+  fi
+  endpoint="$(endpoint_json)"
+  cat <<EOF
+  "upstreams": [
+    {
+      "name": "$(json_escape "$DEFAULT_UPSTREAM_NAME")",
+      "transport": "$(json_escape "$DEFAULT_UPSTREAM_TRANSPORT")",
+      ${endpoint},
+$(upstream_optional_json)      "dial_timeout": "$(json_escape "$DEFAULT_DIAL_TIMEOUT")",
+      "kless": {
+        "client_id": "$(json_escape "$client_id")",
+        "client_secret": "$(json_escape "$KNODE_CLIENT_SECRET")",
+        "server_signing_key": "$(json_escape "$KNODE_SERVER_SIGNING_KEY")",
+$(kless_optional_json)        "max_frame_payload": ${DEFAULT_MAX_FRAME_PAYLOAD},
+        "padding_min": ${DEFAULT_PADDING_MIN},
+        "padding_max": ${DEFAULT_PADDING_MAX},
+        "handshake_timeout": "$(json_escape "$DEFAULT_HANDSHAKE_TIMEOUT")"
+      }
+    }
+  ],
+EOF
 }
 
 upstream_optional_json() {
@@ -355,6 +415,51 @@ kless_optional_json() {
   fi
 }
 
+inbounds_json() {
+  local mode client_id
+  mode="$(normalize_inbound_mode)"
+  client_id="${KNODE_CLIENT_ID:-$DEFAULT_NODE_ID}"
+  case "$mode" in
+    tcp)
+      cat <<EOF
+  "inbounds": [
+    {
+      "name": "$(json_escape "$DEFAULT_INBOUND_NAME")",
+      "listen": "$(json_escape "$DEFAULT_INBOUND_LISTEN")",
+      "mode": "tcp",
+      "upstream": "$(json_escape "$DEFAULT_UPSTREAM_NAME")",
+      "max_connections": ${DEFAULT_MAX_CONNECTIONS}
+    }
+  ]
+EOF
+      ;;
+    kless-server)
+      cat <<EOF
+  "inbounds": [
+    {
+      "name": "$(json_escape "$DEFAULT_INBOUND_NAME")",
+      "listen": "$(json_escape "$DEFAULT_INBOUND_LISTEN")",
+      "mode": "kless-server",
+      "max_connections": ${DEFAULT_MAX_CONNECTIONS},
+      "kless": {
+        "client_id": "$(json_escape "$client_id")",
+        "client_secret": "$(json_escape "$KNODE_CLIENT_SECRET")",
+        "server_signing_key": "$(json_escape "$KNODE_SERVER_SIGNING_KEY")",
+        "server_signing_private": "$(json_escape "$KNODE_SERVER_SIGNING_PRIVATE")",
+$(kless_optional_json)        "max_frame_payload": ${DEFAULT_MAX_FRAME_PAYLOAD},
+        "padding_min": ${DEFAULT_PADDING_MIN},
+        "padding_max": ${DEFAULT_PADDING_MAX},
+        "handshake_timeout": "$(json_escape "$DEFAULT_HANDSHAKE_TIMEOUT")",
+        "max_handshake_skew": "$(json_escape "$DEFAULT_MAX_HANDSHAKE_SKEW")",
+        "users_refresh_interval": "$(json_escape "$DEFAULT_USERS_REFRESH_INTERVAL")"
+      }
+    }
+  ]
+EOF
+      ;;
+  esac
+}
+
 kboard_config_json() {
   kboard_config_available || return 0
   cat <<EOF
@@ -380,16 +485,16 @@ backup_config() {
 }
 
 write_env_config() {
-  local dir endpoint client_id
+  local dir client_id
   dir="$(dirname "$CONFIG_PATH")"
   client_id="${KNODE_CLIENT_ID:-$DEFAULT_NODE_ID}"
 
   env_config_available || return 1
+  ensure_kless_material
   ensure_uint "$DEFAULT_MAX_CONNECTIONS" "KNODE_MAX_CONNECTIONS"
   ensure_uint "$DEFAULT_MAX_FRAME_PAYLOAD" "KNODE_MAX_FRAME_PAYLOAD"
   ensure_uint "$DEFAULT_PADDING_MIN" "KNODE_PADDING_MIN"
   ensure_uint "$DEFAULT_PADDING_MAX" "KNODE_PADDING_MAX"
-  endpoint="$(endpoint_json)"
 
   install -d -m 0755 "$dir"
   cat > "$CONFIG_PATH" <<EOF
@@ -399,31 +504,8 @@ write_env_config() {
     "address": "$(json_escape "$DEFAULT_ADMIN_ADDR")"
   },
   "shutdown_grace": "$(json_escape "$DEFAULT_SHUTDOWN_GRACE")",
-$(kboard_config_json)  "upstreams": [
-    {
-      "name": "$(json_escape "$DEFAULT_UPSTREAM_NAME")",
-      "transport": "$(json_escape "$DEFAULT_UPSTREAM_TRANSPORT")",
-      ${endpoint},
-$(upstream_optional_json)      "dial_timeout": "$(json_escape "$DEFAULT_DIAL_TIMEOUT")",
-      "kless": {
-        "client_id": "$(json_escape "$client_id")",
-        "client_secret": "$(json_escape "$KNODE_CLIENT_SECRET")",
-        "server_signing_key": "$(json_escape "$KNODE_SERVER_SIGNING_KEY")",
-$(kless_optional_json)        "max_frame_payload": ${DEFAULT_MAX_FRAME_PAYLOAD},
-        "padding_min": ${DEFAULT_PADDING_MIN},
-        "padding_max": ${DEFAULT_PADDING_MAX},
-        "handshake_timeout": "$(json_escape "$DEFAULT_HANDSHAKE_TIMEOUT")"
-      }
-    }
-  ],
-  "inbounds": [
-    {
-      "name": "$(json_escape "$DEFAULT_INBOUND_NAME")",
-      "listen": "$(json_escape "$DEFAULT_INBOUND_LISTEN")",
-      "upstream": "$(json_escape "$DEFAULT_UPSTREAM_NAME")",
-      "max_connections": ${DEFAULT_MAX_CONNECTIONS}
-    }
-  ]
+$(kboard_config_json)$(upstreams_json)
+$(inbounds_json)
 }
 EOF
   chmod 0600 "$CONFIG_PATH"
