@@ -22,9 +22,10 @@ type serverRelay struct {
 	metrics  *Metrics
 	dialer   net.Dialer
 	listenID string
+	access   *accessLogBuffer
 }
 
-func newServerRelay(listenID string, cfg config.ServerKLESSConfig, logger *log.Logger, metrics *Metrics, store *dynamicClientStore) (*serverRelay, error) {
+func newServerRelay(listenID string, cfg config.ServerKLESSConfig, logger *log.Logger, metrics *Metrics, store *dynamicClientStore, access *accessLogBuffer) (*serverRelay, error) {
 	privateKey, err := cfg.ServerSigningPrivateBytes()
 	if err != nil {
 		return nil, err
@@ -45,6 +46,7 @@ func newServerRelay(listenID string, cfg config.ServerKLESSConfig, logger *log.L
 		metrics:  metrics,
 		listenID: listenID,
 		dialer:   net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second},
+		access:   access,
 	}, nil
 }
 
@@ -87,6 +89,12 @@ func (r *serverRelay) Handle(ctx context.Context, raw net.Conn) {
 		r.metrics.addProxyError()
 		r.logger.Printf("inbound %s client %s relay request failed: %v", r.listenID, info.ClientID, err)
 		return
+	}
+	if r.access != nil {
+		userID := r.store.UserID(info.ClientID)
+		if ok := r.access.Record(accessLogItem(info.ClientID, userID, target, raw.RemoteAddr().String(), time.Now())); !ok {
+			r.logger.Printf("inbound %s client %s access log queue is full or invalid", r.listenID, info.ClientID)
+		}
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)

@@ -23,6 +23,7 @@ type Service struct {
 
 	dialers map[string]*UpstreamDialer
 	relays  map[string]*serverRelay
+	access  *accessLogBuffer
 
 	mu               sync.RWMutex
 	adminAddr        string
@@ -57,6 +58,7 @@ func New(cfg config.Config, logger *log.Logger) (*Service, error) {
 	}
 	userStore := newDynamicClientStore()
 	metrics := NewMetrics()
+	accessLogs := newAccessLogBuffer()
 	relays := make(map[string]*serverRelay)
 	for _, inbound := range cfg.Inbounds {
 		if inbound.Mode != config.InboundModeKLESSServer {
@@ -65,7 +67,7 @@ func New(cfg config.Config, logger *log.Logger) (*Service, error) {
 		if err := requireKLESSServerRelay(inbound); err != nil {
 			return nil, err
 		}
-		relay, err := newServerRelay(inbound.Name, inbound.KLESS, logger, metrics, userStore)
+		relay, err := newServerRelay(inbound.Name, inbound.KLESS, logger, metrics, userStore, accessLogs)
 		if err != nil {
 			return nil, fmt.Errorf("inbound %q: %w", inbound.Name, err)
 		}
@@ -78,6 +80,7 @@ func New(cfg config.Config, logger *log.Logger) (*Service, error) {
 		metrics:      metrics,
 		dialers:      dialers,
 		relays:       relays,
+		access:       accessLogs,
 		inboundAddrs: make(map[string]string, len(cfg.Inbounds)),
 	}, nil
 }
@@ -136,7 +139,7 @@ func (s *Service) Run(ctx context.Context) error {
 			userStore = relay.store
 			break
 		}
-		reporter := newKboardReporter(*s.cfg.Kboard, s.cfg.NodeID, s.logger, s.Status, userStore)
+		reporter := newKboardReporter(*s.cfg.Kboard, s.cfg.NodeID, s.logger, s.Status, userStore, s.access)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

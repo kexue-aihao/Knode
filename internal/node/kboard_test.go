@@ -79,7 +79,7 @@ func TestKboardReporterAliveUsesKboardProtocol(t *testing.T) {
 		AliveEndpoint:    "/kb-prefix/knode/control/alive?source=test",
 	}, "kboard-node-2", log.New(io.Discard, "", 0), func() Status {
 		return Status{Metrics: MetricsSnapshot{Active: 7}}
-	}, nil)
+	}, nil, nil)
 
 	reporter.reportAlive(context.Background())
 
@@ -134,7 +134,7 @@ func TestKboardReporterTrafficUsesEmptyBatch(t *testing.T) {
 		TrafficEndpoint:  "/kb-prefix/knode/control/traffic",
 	}, "kboard-node-2", log.New(io.Discard, "", 0), func() Status {
 		return Status{}
-	}, nil)
+	}, nil, nil)
 
 	reporter.reportTraffic(context.Background())
 
@@ -154,6 +154,90 @@ func TestKboardReporterTrafficUsesEmptyBatch(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("traffic report was not received")
+	}
+}
+
+func TestKboardReporterAccessLogsReportsBufferedItems(t *testing.T) {
+	const (
+		nodeID = "5"
+		secret = "test-node-shared-secret"
+	)
+
+	payloadCh := make(chan map[string]any, 1)
+	errCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/kb-prefix/knode/control/access-logs" {
+			errCh <- fmt.Errorf("path = %q", r.URL.EscapedPath())
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
+		}
+		if err := verifyKboardRequest(r, secret, nodeID); err != nil {
+			errCh <- err
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		defer r.Body.Close()
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			errCh <- err
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		payloadCh <- payload
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	buffer := newAccessLogBuffer()
+	if ok := buffer.Record(kboardAccessLogItem{
+		ClientID:      "user-uuid",
+		KLESSClientID: "user-uuid",
+		Domain:        "www.google.com",
+		Host:          "www.google.com",
+		URI:           "https://www.google.com",
+		Protocol:      "https",
+		RemoteAddr:    "192.0.2.1:50000",
+		AccessedAt:    1800000000,
+	}); !ok {
+		t.Fatal("access log item was not buffered")
+	}
+	reporter := newKboardReporter(config.KboardConfig{
+		PublicURL:          server.URL,
+		NodeID:             nodeID,
+		NodeSharedSecret:   secret,
+		AccessLogsEndpoint: "/kb-prefix/knode/control/access-logs",
+	}, "kboard-node-5", log.New(io.Discard, "", 0), func() Status {
+		return Status{}
+	}, nil, buffer)
+
+	reporter.reportAccessLogs(context.Background())
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case payload := <-payloadCh:
+		if got, ok := payload["batch_id"].(string); !ok || !strings.HasPrefix(got, "knode-access-kboard-node-5-") {
+			t.Fatalf("batch_id = %#v", payload["batch_id"])
+		}
+		items, ok := payload["items"].([]any)
+		if !ok {
+			t.Fatalf("items = %#v, want array", payload["items"])
+		}
+		if len(items) != 1 {
+			t.Fatalf("len(items) = %d, want 1", len(items))
+		}
+		item, ok := items[0].(map[string]any)
+		if !ok {
+			t.Fatalf("item = %#v", items[0])
+		}
+		if item["kless_client_id"] != "user-uuid" || item["domain"] != "www.google.com" || item["protocol"] != "https" {
+			t.Fatalf("item = %#v", item)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("access log report was not received")
+	}
+	if drained := buffer.Drain(1); len(drained) != 0 {
+		t.Fatalf("buffer still has %d items", len(drained))
 	}
 }
 
@@ -201,7 +285,7 @@ func TestKboardReporterSyncUsersUpdatesDynamicClientStore(t *testing.T) {
 		UsersEndpoint:    "/kb-prefix/knode/control/users",
 	}, "kboard-node-2", log.New(io.Discard, "", 0), func() Status {
 		return Status{}
-	}, store)
+	}, store, nil)
 
 	reporter.syncUsers(context.Background())
 
@@ -269,7 +353,7 @@ func TestKboardReporterSyncUsersSupportsWrappedDataResponse(t *testing.T) {
 		UsersEndpoint:    "/kb-prefix/knode/control/users",
 	}, "kboard-node-4", log.New(io.Discard, "", 0), func() Status {
 		return Status{}
-	}, store)
+	}, store, nil)
 
 	reporter.syncUsers(context.Background())
 

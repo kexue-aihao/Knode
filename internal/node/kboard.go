@@ -33,6 +33,7 @@ type kboardReporter struct {
 	runtimeInfo string
 	userStore   *dynamicClientStore
 	usersETag   string
+	accessLogs  *accessLogBuffer
 }
 
 type KboardUser struct {
@@ -73,7 +74,7 @@ func (r *kboardUsersResponse) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func newKboardReporter(cfg config.KboardConfig, nodeID string, logger *log.Logger, status func() Status, userStore *dynamicClientStore) *kboardReporter {
+func newKboardReporter(cfg config.KboardConfig, nodeID string, logger *log.Logger, status func() Status, userStore *dynamicClientStore, accessLogs *accessLogBuffer) *kboardReporter {
 	hostname, _ := os.Hostname()
 	return &kboardReporter{
 		cfg:         cfg,
@@ -84,6 +85,7 @@ func newKboardReporter(cfg config.KboardConfig, nodeID string, logger *log.Logge
 		hostname:    hostname,
 		runtimeInfo: fmt.Sprintf("%s/%s-%s", runtime.Version(), runtime.GOOS, runtime.GOARCH),
 		userStore:   userStore,
+		accessLogs:  accessLogs,
 	}
 }
 
@@ -93,12 +95,17 @@ func (r *kboardReporter) run(ctx context.Context) {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	accessTicker := time.NewTicker(accessLogFlushPeriod)
+	defer accessTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			r.reportAccessLogs(context.Background())
 			return
 		case <-ticker.C:
 			r.report(ctx)
+		case <-accessTicker.C:
+			r.reportAccessLogs(ctx)
 		}
 	}
 }
@@ -107,6 +114,7 @@ func (r *kboardReporter) report(ctx context.Context) {
 	r.syncUsers(ctx)
 	r.reportAlive(ctx)
 	r.reportTraffic(ctx)
+	r.reportAccessLogs(ctx)
 }
 
 func (r *kboardReporter) syncUsers(ctx context.Context) {
@@ -164,6 +172,24 @@ func (r *kboardReporter) reportTraffic(ctx context.Context) {
 	}
 	if err := r.postJSON(ctx, r.cfg.TrafficEndpoint, payload); err != nil {
 		r.logger.Printf("kboard traffic report failed: %v", err)
+	}
+}
+
+func (r *kboardReporter) reportAccessLogs(ctx context.Context) {
+	if r.cfg.AccessLogsEndpoint == "" || r.accessLogs == nil {
+		return
+	}
+	items := r.accessLogs.Drain(maxAccessLogBatchSize)
+	if len(items) == 0 {
+		return
+	}
+	payload := map[string]any{
+		"batch_id": fmt.Sprintf("knode-access-%s-%d", safeBatchNodeID(r.nodeID), time.Now().UnixNano()),
+		"items":    items,
+	}
+	if err := r.postJSON(ctx, r.cfg.AccessLogsEndpoint, payload); err != nil {
+		r.accessLogs.Restore(items)
+		r.logger.Printf("kboard access logs report failed: %v", err)
 	}
 }
 
