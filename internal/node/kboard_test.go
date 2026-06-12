@@ -222,6 +222,77 @@ func TestKboardReporterSyncUsersUpdatesDynamicClientStore(t *testing.T) {
 	}
 }
 
+func TestKboardReporterSyncUsersSupportsWrappedDataResponse(t *testing.T) {
+	const (
+		nodeID = "4"
+		secret = "test-node-shared-secret"
+	)
+
+	clientSecret := []byte("wrapped-kless-client-secret-0001")
+	errCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			errCh <- fmt.Errorf("method = %s", r.Method)
+			http.Error(w, "bad method", http.StatusBadRequest)
+			return
+		}
+		if err := verifyKboardRequest(r, secret, nodeID); err != nil {
+			errCh <- err
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"protocol_version": "kboard-knode-control/1",
+				"node_id":          4,
+				"users": []map[string]any{
+					{
+						"id":                  2,
+						"uuid":                "legacy-user-id",
+						"client_id":           "legacy-client-id",
+						"client_secret":       encodeClientSecret([]byte("legacy-client-secret-000000000001")),
+						"kless_client_id":     "kless-client-id",
+						"kless_client_secret": encodeClientSecret(clientSecret),
+					},
+				},
+				"count": 1,
+			},
+		})
+	}))
+	defer server.Close()
+
+	store := newDynamicClientStore()
+	reporter := newKboardReporter(config.KboardConfig{
+		PublicURL:        server.URL,
+		NodeID:           nodeID,
+		NodeSharedSecret: secret,
+		UsersEndpoint:    "/kb-prefix/knode/control/users",
+	}, "kboard-node-4", log.New(io.Discard, "", 0), func() Status {
+		return Status{}
+	}, store)
+
+	reporter.syncUsers(context.Background())
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+	got, ok := store.LookupClientSecret("kless-client-id")
+	if !ok {
+		t.Fatal("wrapped kless client secret not loaded")
+	}
+	if string(got) != string(clientSecret) {
+		t.Fatalf("client secret = %q, want %q", got, clientSecret)
+	}
+	if _, ok := store.LookupClientSecret("legacy-client-id"); ok {
+		t.Fatal("legacy client id should not be preferred when kless_client_id is present")
+	}
+	if userID := store.UserID("kless-client-id"); userID != 2 {
+		t.Fatalf("user id = %d, want 2", userID)
+	}
+}
+
 func verifyKboardRequest(r *http.Request, secret, nodeID string) error {
 	if got := r.Header.Get("X-KBoard-Node-ID"); got != nodeID {
 		return fmt.Errorf("node header = %q", got)

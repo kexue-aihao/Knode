@@ -36,12 +36,13 @@ type kboardReporter struct {
 }
 
 type KboardUser struct {
-	ID           int64  `json:"id"`
-	UUID         string `json:"uuid"`
-	Token        string `json:"token,omitempty"`
-	ClientID     string `json:"client_id,omitempty"`
-	ClientSecret string `json:"client_secret,omitempty"`
-	KLESSSecret  string `json:"kless_client_secret,omitempty"`
+	ID            int64  `json:"id"`
+	UUID          string `json:"uuid"`
+	Token         string `json:"token,omitempty"`
+	ClientID      string `json:"client_id,omitempty"`
+	KLESSClientID string `json:"kless_client_id,omitempty"`
+	ClientSecret  string `json:"client_secret,omitempty"`
+	KLESSSecret   string `json:"kless_client_secret,omitempty"`
 }
 
 type kboardUsersResponse struct {
@@ -50,6 +51,26 @@ type kboardUsersResponse struct {
 	Users           []KboardUser `json:"users"`
 	Count           int          `json:"count"`
 	PulledAt        int64        `json:"pulled_at"`
+}
+
+func (r *kboardUsersResponse) UnmarshalJSON(data []byte) error {
+	type plain kboardUsersResponse
+	var top plain
+	if err := json.Unmarshal(data, &top); err != nil {
+		return err
+	}
+	if top.ProtocolVersion != "" || top.NodeID != 0 || top.Users != nil || top.Count != 0 || top.PulledAt != 0 {
+		*r = kboardUsersResponse(top)
+		return nil
+	}
+	var wrapped struct {
+		Data plain `json:"data"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err != nil {
+		return err
+	}
+	*r = kboardUsersResponse(wrapped.Data)
+	return nil
 }
 
 func newKboardReporter(cfg config.KboardConfig, nodeID string, logger *log.Logger, status func() Status, userStore *dynamicClientStore) *kboardReporter {

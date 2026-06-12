@@ -120,6 +120,9 @@ func encodeClientSecret(secret []byte) string {
 }
 
 func clientIDForUser(user KboardUser) string {
+	if user.KLESSClientID != "" {
+		return user.KLESSClientID
+	}
 	if user.ClientID != "" {
 		return user.ClientID
 	}
