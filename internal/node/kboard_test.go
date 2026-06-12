@@ -163,7 +163,8 @@ func TestKboardReporterSyncUsersUpdatesDynamicClientStore(t *testing.T) {
 		secret = "test-node-shared-secret"
 	)
 
-	clientSecret := []byte("01234567890123456789012345678901")
+	legacyClientSecret := []byte("legacy-client-secret-000000000001")
+	clientSecret := []byte("kless-client-secret-0000000000001")
 	errCh := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -181,9 +182,10 @@ func TestKboardReporterSyncUsersUpdatesDynamicClientStore(t *testing.T) {
 			"node_id":          2,
 			"users": []map[string]any{
 				{
-					"id":            1001,
-					"uuid":          "user-uuid",
-					"client_secret": encodeClientSecret(clientSecret),
+					"id":                  1001,
+					"uuid":                "user-uuid",
+					"client_secret":       encodeClientSecret(legacyClientSecret),
+					"kless_client_secret": encodeClientSecret(clientSecret),
 				},
 			},
 			"count": 1,

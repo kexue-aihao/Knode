@@ -250,9 +250,9 @@ func (r *kboardReporter) userCredential(user KboardUser) (ClientCredential, bool
 	if clientID == "" {
 		return ClientCredential{}, false
 	}
-	secretText := strings.TrimSpace(user.ClientSecret)
+	secretText := strings.TrimSpace(user.KLESSSecret)
 	if secretText == "" {
-		secretText = strings.TrimSpace(user.KLESSSecret)
+		secretText = strings.TrimSpace(user.ClientSecret)
 	}
 	var secret []byte
 	if secretText != "" {
