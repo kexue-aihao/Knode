@@ -83,9 +83,9 @@ func (b *accessLogBuffer) Restore(items []kboardAccessLogItem) {
 	b.items = restored
 }
 
-func accessLogItem(clientID string, userID int64, target RelayTarget, remoteAddr string, now time.Time) kboardAccessLogItem {
+func accessLogItem(clientID string, userID int64, target RelayTarget, network, remoteAddr string, now time.Time) kboardAccessLogItem {
 	host := strings.TrimSpace(target.Host)
-	protocol := protocolForTarget(target.Port)
+	protocol := protocolForTarget(network, target.Port)
 	item := kboardAccessLogItem{
 		ClientID:      strings.TrimSpace(clientID),
 		KLESSClientID: strings.TrimSpace(clientID),
@@ -102,7 +102,10 @@ func accessLogItem(clientID string, userID int64, target RelayTarget, remoteAddr
 	return item
 }
 
-func protocolForTarget(port uint16) string {
+func protocolForTarget(network string, port uint16) string {
+	if strings.EqualFold(strings.TrimSpace(network), "udp") {
+		return "udp"
+	}
 	switch port {
 	case 80:
 		return "http"

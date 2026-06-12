@@ -20,6 +20,7 @@ import (
 
 	"github.com/kexue-aihao/Knode/internal/config"
 	"kray/pkg/kless"
+	"kray/pkg/relay"
 )
 
 func TestServiceProxiesTCPOverKLESS(t *testing.T) {
@@ -178,11 +179,15 @@ func TestServiceAcceptsKrayNRelayOverKLESS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeConnectRequest(secure, RelayTarget{Host: host, Port: targetPort}); err != nil {
+	if err := relay.WriteRequest(secure, relay.TCPConnect(host, targetPort)); err != nil {
 		t.Fatal(err)
 	}
-	if err := readConnectResponse(secure); err != nil {
+	resp, err := relay.ReadResponse(secure)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if resp.Status != relay.StatusOK {
+		t.Fatalf("relay response = %+v, want ok", resp)
 	}
 	payload := []byte("hello direct krayn relay")
 	if _, err := secure.Write(payload); err != nil {
@@ -194,6 +199,118 @@ func TestServiceAcceptsKrayNRelayOverKLESS(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("service did not stop")
+	}
+	select {
+	case err := <-targetErr:
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("target error = %v", err)
+		}
+	default:
+	}
+}
+
+func TestServiceAcceptsKrayNUDPAssociateOverKLESS(t *testing.T) {
+	serverPublic, serverPrivate, err := kless.GenerateServerIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientSecret, err := kless.GenerateClientSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	targetErr := make(chan error, 1)
+	go serveUDPEcho(target, targetErr)
+
+	cfg := config.Config{
+		NodeID: "knode-relay",
+		Admin:  config.AdminConfig{Address: "127.0.0.1:0"},
+		Inbounds: []config.InboundConfig{
+			{
+				Name:   "public-kless",
+				Listen: "127.0.0.1:0",
+				Mode:   config.InboundModeKLESSServer,
+				KLESS: config.ServerKLESSConfig{
+					ClientID:             "test-client",
+					ClientSecret:         kless.EncodeKey(clientSecret),
+					ServerSigningKey:     kless.EncodeKey(serverPublic),
+					ServerSigningPrivate: kless.EncodeKey(serverPrivate),
+				},
+			},
+		},
+	}
+
+	svc, err := New(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- svc.Run(ctx)
+	}()
+
+	inboundAddress := waitForAddress(t, func() string { return svc.InboundAddress("public-kless") })
+	raw, err := net.DialTimeout("tcp", inboundAddress, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	secure, err := kless.ClientHandshake(raw, kless.ClientConfig{
+		ClientID:         "test-client",
+		ClientSecret:     clientSecret,
+		ServerSigningKey: ed25519.PublicKey(serverPublic),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secure.Close()
+	if err := relay.WriteRequest(secure, relay.UDPAssociate("0.0.0.0", 0)); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := relay.ReadResponse(secure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != relay.StatusOK {
+		t.Fatalf("relay response = %+v, want ok", resp)
+	}
+	host, portText, err := net.SplitHostPort(target.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPort, err := parseUint16(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.WriteDatagram(secure, relay.Datagram{
+		Address: relay.Address{Host: host, Port: targetPort},
+		Payload: []byte("udp query"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := relay.ReadDatagram(secure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Address.Port != targetPort || string(got.Payload) != "udp query" {
+		t.Fatalf("udp response = %+v payload %q", got.Address, got.Payload)
 	}
 
 	cancel()
@@ -384,6 +501,17 @@ func servePlainEcho(listener net.Listener, errCh chan<- error) {
 	}
 	defer raw.Close()
 	_, err = io.Copy(raw, raw)
+	errCh <- err
+}
+
+func serveUDPEcho(conn net.PacketConn, errCh chan<- error) {
+	buf := make([]byte, 2048)
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil {
+		errCh <- err
+		return
+	}
+	_, err = conn.WriteTo(buf[:n], addr)
 	errCh <- err
 }
 
